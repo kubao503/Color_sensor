@@ -22,6 +22,7 @@
 #include "soc/rtc_cntl_reg.h"  // Disable brownour problems
 #include "driver/rtc_io.h"
 #include "img_converters.h"    // frame type conversions
+#include <map>
 
 // Pin definition for CAMERA_MODEL_AI_THINKER
 #define PWDN_GPIO_NUM     32
@@ -41,9 +42,17 @@
 #define VSYNC_GPIO_NUM    25
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
+#define JPEG_QUALITY      10
 
 // Variable holding picture
 camera_fb_t * fb;
+//LED setup 
+int freq = 5000;
+int ledCHannel = 4;
+int res = 8;
+const int ledPin = 4;
+int dutyCycle = 4;
+
 void take_photo(bool save);
 void analyse_photo();
 
@@ -80,10 +89,10 @@ void setup() {
   if(psramFound()){
     Serial.print("Psram found\n");
     // Frame size
-//    config.frame_size = FRAMESIZE_96X96;
-    config.frame_size = FRAMESIZE_QVGA;
+    config.frame_size = FRAMESIZE_240X240;
+//    config.frame_size = FRAMESIZE_VGA;
 //    config.frame_size = FRAMESIZE_UXGA; // FRAMESIZE_ + QVGA|CIF|VGA|SVGA|XGA|SXGA|UXGA
-    config.jpeg_quality = 10;
+    config.jpeg_quality = JPEG_QUALITY;
     config.fb_count = 2;
   } else {
     Serial.print("Psram not found\n");
@@ -119,14 +128,6 @@ void setup() {
   // Variable holding picture
   fb = NULL;
 
-  // Not working led lightning
-  //LED setup 
-  int freq = 5000;
-  int ledCHannel = 4;
-  int res = 8;
-  const int ledPin = 4;
-  int dutyCycle = 1;
-
   ledcSetup(ledCHannel, freq, res);
   ledcAttachPin(ledPin, ledCHannel);
   ledcWrite(ledCHannel, dutyCycle);
@@ -139,6 +140,34 @@ void setup() {
 //  rtc_gpio_hold_en(GPIO_NUM_4);
 }
 
+std::vector<int> select_pixels(camera_fb_t * const fb) {
+  std::vector<int> selected_pixels = {};
+  const char *data = (const char *)fb->buf;
+  size_t size = fb->len;
+
+  const int treshold = 150;
+//  selected_pixels.push_back(1);
+
+  for (int i = 0; i < size - 2; i += 3) {
+    if ((int)data[i] >= treshold && (int)data[i + 1] >= treshold && (int)data[i + 2] >= treshold) {
+      selected_pixels.push_back(i);
+    }
+  }
+
+  return selected_pixels;
+}
+
+void highlight_pixels(camera_fb_t * fb, const std::vector<int> &selected_pixels) {
+  char *data = (char *)fb->buf;
+  for (int pixel_id : selected_pixels) {
+//    Serial.print((int)data[pixel_id]);
+    (fb->buf)[pixel_id + 2] = (char)(200);
+//    Serial.print(" ");
+//    Serial.print((int)data[pixel_id]);
+//    Serial.print("\n"); 
+  }
+}
+
 void take_photo(bool save) {
   // Take Picture with Camera
   fb = esp_camera_fb_get();  
@@ -148,14 +177,18 @@ void take_photo(bool save) {
   }
 
   // Saving photo into SD card
-  if (save) {
+  if (save) {   
     // Path where new picture will be saved in SD Card
     String path = "/last_picture.jpg";
+
+    // Highlight bright pixels
+    auto selected_pixels = select_pixels(fb);
+    highlight_pixels(fb, selected_pixels);
 
     // Convert frame
     uint8_t * buf;
     size_t buf_len;
-    if (!frame2jpg(fb, 10, &buf, &buf_len)) {
+    if (!frame2jpg(fb, JPEG_QUALITY, &buf, &buf_len)) {
       Serial.print("Conversion to JPG failed\n");
     } else {
       Serial.print("Conversion to JPG successful\n");
@@ -182,13 +215,65 @@ void take_photo(bool save) {
   esp_camera_fb_return(fb); 
 }
 
-void analyse_photo() {
-  // Retreive information from fb object
-  const char *data = (const char *)fb->buf;
-  size_t size = fb->len;
-  int width = 3 * fb->width;
-  int height = 3 * fb->height;
+struct Color {
+  Color(int new_r, int new_g, int new_b) {
+    r = new_r;
+    g = new_g;
+    b = new_b;
+  }
+  int r;
+  int g;
+  int b;
+  bool operator<(const Color &other) const {
+    return this->r < other.r;
+  }
+  bool operator!=(const Color &other) const {
+    return (this->r != other.r || this->g != other.g || this->b != other.b);
+  }
+};
 
+//bool colors_similar(const Color &model, const Color &other) {
+//  const int epsilon = 10;
+//  return abs(model.r - other.r) <= epsilon && abs(model.g - other.g) <= epsilon && abs(model.b - other.b) <= epsilon;
+//}
+
+Color simplify(const Color &color, int number_of_colors, int max_color_value=256) {
+  int step = max_color_value / number_of_colors;
+  return Color((color.r / step) * step, (color.g / step) * step, (color.b / step) * step);
+}
+
+void display_dominant_color(const char *data, const size_t size) {
+  std::map<Color, int> classified_colors;
+  
+  // Iterating over pixels
+  for (int i = 0; i < size; i += 3) {
+    // check if this pixel's color has already been classified
+    Color current_color = Color((int)data[i + 2], (int)data[i + 1], (int)data[i]);
+    Color simplified_color = simplify(current_color, 8);
+    try {
+      classified_colors.at(simplified_color) += 1;  
+    }
+    catch (const std::out_of_range &e) {
+      classified_colors[simplified_color] = 1;
+    }
+  }
+
+  Color max_color = {0, 0, 0};
+  int max_occurences = 0;
+//  Color max_color_2 = {0, 0, 0};
+//  int max_occurences_2 = 0;
+  // Search for dominant color
+  for (auto &color : classified_colors) {
+    if (color.second > max_occurences && color.first != Color(0, 0, 0)) {
+      max_color = color.first;
+      max_occurences = color.second;
+    }
+  }
+
+  Serial.printf("Dominant color: %dR %dG %dB with %d occurences\n", max_color.r, max_color.g, max_color.b, max_occurences);
+}
+
+void display_average(const char *data, const size_t size) {
   int red_sum = 0;
   int green_sum = 0;
   int blue_sum = 0;
@@ -209,11 +294,27 @@ void analyse_photo() {
   int red_average = red_sum * 3 / size;
   int green_average = green_sum * 3 / size;
   int blue_average = blue_sum * 3 / size;
-  // Analyse the colorbar
+  
   Serial.printf("R%d G%d B%d\n", red_average, green_average, blue_average);
 }
 
+void analyse_photo() {
+  // Retreive information from fb object
+  const char *data = (const char *)fb->buf;
+  size_t size = fb->len;
+  int width = 3 * fb->width;
+  int height = 3 * fb->height;
+
+  display_dominant_color(data, size);  
+}
+
 void loop() {
+//  dutyCycle += 1;
+//  if (dutyCycle > 40) {
+//    dutyCycle = 1;
+//  }
+//  ledcWrite(ledCHannel, dutyCycle);
   take_photo(false);
-  analyse_photo();
+//  analyse_photo();
+  delay(750);
 }
